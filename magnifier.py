@@ -29,32 +29,8 @@ import win32gui
 import win32con
 import win32api
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
+from Config import config
 
-TOGGLE_KEY      = "v"
-ZOOM            = 2.0
-ZOOM_MIN        = 1.5
-ZOOM_MAX        = 6.0
-ZOOM_STEP       = 0.25
-
-CAPTURE_RADIUS  = 200       # half-width of capture box (200 → grabs 400×400)
-CAPTURE_MIN     = 80
-CAPTURE_MAX     = 400
-CAPTURE_STEP    = 20
-
-FPS             = 60
-TOPMOST_MS      = 500       # re-assert topmost every N ms
-
-BORDER_COLOR    = (0, 200, 0)
-BORDER_PX       = 2
-
-CROSSHAIR       = True
-CROSS_COLOR     = (255, 50, 50)
-CROSS_LEN       = 12
-CROSS_GAP       = 4
-CROSS_WIDTH     = 1
-
-SCALING         = Image.NEAREST   # NEAREST = crisp pixels, BILINEAR = smooth
 
 
 # ─── WIN32 HELPERS ───────────────────────────────────────────────────────────
@@ -187,11 +163,15 @@ class Magnifier:
     def __init__(self):
         self.on = False
         self.alive = True
-        self.zoom = ZOOM
-        self.radius = CAPTURE_RADIUS
+        self.zoom = config.ZOOM
+        self.radius = config.CAPTURE_RADIUS
         self.win = None
         self._last_topmost = 0
         self._last_size = 0
+
+        # self.hotkey_hook = None
+        self.zoomHook = None
+        # self.bind_hotkey()
 
         self.sct = mss.mss()
         m = self.sct.monitors[1]
@@ -217,13 +197,13 @@ class Magnifier:
         draw = ImageDraw.Draw(img)
         w, h = img.size
 
-        if BORDER_PX:
-            for i in range(BORDER_PX):
-                draw.rectangle([i, i, w-1-i, h-1-i], outline=BORDER_COLOR)
+        if config.BORDER_PX:
+            for i in range(config.BORDER_PX):
+                draw.rectangle([i, i, w-1-i, h-1-i], outline=config.BORDER_COLOR)
 
-        if CROSSHAIR:
+        if config.CROSSHAIR:
             cx, cy = w // 2, h // 2
-            g, s, lw, c = CROSS_GAP, CROSS_LEN, CROSS_WIDTH, CROSS_COLOR
+            g, s, lw, c = config.CROSS_GAP, config.CROSS_LEN, config.CROSS_WIDTH, config.CROSS_COLOR
             draw.line([(cx-s, cy), (cx-g, cy)], fill=c, width=lw)
             draw.line([(cx+g, cy), (cx+s, cy)], fill=c, width=lw)
             draw.line([(cx, cy-s), (cx, cy-g)], fill=c, width=lw)
@@ -244,18 +224,18 @@ class Magnifier:
     # ── main loop ────────────────────────────────────────────────────────
 
     def run(self):
-        keyboard.on_press_key(TOGGLE_KEY, lambda _: self.toggle(), suppress=False)
-        keyboard.on_press_key("+", lambda _: self.adj_zoom(ZOOM_STEP))
-        keyboard.on_press_key("=", lambda _: self.adj_zoom(ZOOM_STEP))
-        keyboard.on_press_key("-", lambda _: self.adj_zoom(-ZOOM_STEP))
-        keyboard.on_press_key("]", lambda _: self.adj_radius(CAPTURE_STEP))
-        keyboard.on_press_key("[", lambda _: self.adj_radius(-CAPTURE_STEP))
-        keyboard.on_press_key("esc", lambda _: self.quit())
+        self.zoomHook = keyboard.on_press_key(config.TOGGLE_KEY, lambda _: self.toggle(), suppress=False)
+        #keyboard.on_press_key("+", lambda _: self.adj_zoom(ZOOM_STEP))v
+        keyboard.on_press_key("=", lambda _: self.adj_zoom(config.ZOOM_STEP))
+        keyboard.on_press_key("-", lambda _: self.adj_zoom(-config.ZOOM_STEP))
+        keyboard.on_press_key("]", lambda _: self.adj_radius(config.CAPTURE_STEP))
+        keyboard.on_press_key("[", lambda _: self.adj_radius(-config.CAPTURE_STEP))
+        #keyboard.on_press_key("esc", lambda _: self.quit())
 
         print("╔═══════════════════════════════════════════╗")
         print("║        FPS Screen Magnifier               ║")
         print("╠═══════════════════════════════════════════╣")
-        print(f"║  Toggle:   {TOGGLE_KEY:<30s} ║")
+        print(f"║  Toggle:   {config.TOGGLE_KEY:<30s} ║")
         print(f"║  Zoom:     +/-  ({self.zoom:.1f}x)                    ║")
         print(f"║  Region:   [/]  ({self.radius*2}px)                  ║")
         print(f"║  Quit:     Esc                            ║")
@@ -264,7 +244,7 @@ class Magnifier:
         print("╚═══════════════════════════════════════════╝")
         print()
 
-        dt = 1.0 / FPS
+        dt = 1.0 / config.FPS
 
         while self.alive:
             t0 = time.perf_counter()
@@ -274,7 +254,7 @@ class Magnifier:
 
                 # Re-assert topmost so the game can't bury us
                 now = time.perf_counter() * 1000
-                if now - self._last_topmost > TOPMOST_MS:
+                if now - self._last_topmost > config.TOPMOST_MS:
                     self.win.topmost()
                     self._last_topmost = now
 
@@ -286,7 +266,7 @@ class Magnifier:
 
                 img = self.grab()
                 sz = self.size
-                img = img.resize((sz, sz), SCALING)
+                img = img.resize((sz, sz), config.SCALING)
                 self.decorate(img)
                 self.win.blit(img.convert("RGBX"))
                 self.win.show()
@@ -314,18 +294,31 @@ class Magnifier:
 
     def adj_zoom(self, d):
         if not self.on: return
-        self.zoom = round(max(ZOOM_MIN, min(ZOOM_MAX, self.zoom + d)), 2)
+        self.zoom = round(max(config.ZOOM_MIN, min(config.ZOOM_MAX, self.zoom + d)), 2)
         print(f"    zoom → {self.zoom:.1f}x")
 
     def adj_radius(self, d):
         if not self.on: return
-        self.radius = max(CAPTURE_MIN, min(CAPTURE_MAX, self.radius + d))
+        self.radius = max(config.CAPTURE_MIN, min(config.CAPTURE_MAX, self.radius + d))
         print(f"    region → {self.radius*2}px")
 
     def quit(self):
         print("  Shutting down...")
         self.alive = False
 
+    # ── hotkey rebind ─────────────────────────────────────────────────────
+
+    def bind_hotkey(self):
+        # remove old binding
+        if self.zoomHook is not None:
+            keyboard.unhook(self.zoomHook)
+        # register new binding
+        self.zoomHook = keyboard.on_press_key(config.TOGGLE_KEY, lambda _: self.toggle(), suppress=False)
+        print(config.TOGGLE_KEY)
+        print("this was the new key change")
+
+    def update_hotkey(self):
+        self.bind_hotkey()
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
