@@ -8,9 +8,6 @@ from Config import config
 
 mag = Magnifier()
 
-# def start_mag():
-#     threading.Thread(target=mag.run, daemon=True).start()
-
 threading.Thread(target=mag.run, daemon=True).start()
 
 def toggle():

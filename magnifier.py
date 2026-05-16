@@ -1,20 +1,19 @@
 """
-FPS Screen Magnifier
-====================
-Magnifies the center of your screen with a hotkey toggle.
-Uses WDA_EXCLUDEFROMCAPTURE so the overlay never captures itself.
+FPS Screen Magnifier — GPU Accelerated
+=======================================
+Captures the center of your screen with mss, uploads directly to an
+OpenGL texture (skipping PIL entirely), and renders a scaled quad with
+GPU bilinear filtering.
 
 Requirements:
-    pip install mss Pillow keyboard pywin32
+    pip install mss keyboard pywin32 PyOpenGL
 
 Controls:
-    v  → Toggle magnifier on/off
-    +/-       → Zoom in/out
-    [ / ]     → Shrink/grow capture region
-    Esc       → Quit
+    v (default) → Toggle magnifier on/off
+    +/-         → Zoom in/out
+    [ / ]       → Shrink/grow capture region
 
-Your game MUST be in Borderless Windowed mode — Fullscreen Exclusive
-bypasses the Windows compositor and no overlay can draw over it.
+Your game MUST be in Borderless Windowed mode.
 """
 
 import sys
@@ -23,60 +22,116 @@ import ctypes
 
 import mss
 import keyboard
-from PIL import Image, ImageDraw
 
 import win32gui
 import win32con
 import win32api
 
+from OpenGL.GL import *
+
+# Use ctypes for WGL — PyOpenGL's WGL wrappers choke on pywin32 handle types
+opengl32 = ctypes.windll.opengl32
+
 from Config import config
 
-
-
-# ─── WIN32 HELPERS ───────────────────────────────────────────────────────────
+# ─── Win32 / WGL constants ──────────────────────────────────────────────────
 
 user32 = ctypes.windll.user32
 gdi32  = ctypes.windll.gdi32
 
-WDA_EXCLUDEFROMCAPTURE = 0x00000011   # Win10 2004+
+# ── Declare proper 64-bit types (ctypes defaults to c_int = 32-bit,
+#    which truncates HDC/HGLRC pointers on x64 and silently breaks GL) ───
 
-CLASS_NAME = "FPSMagOverlay"
+_vp = ctypes.c_void_p   # shorthand for pointer-sized handles
+
+user32.GetDC.restype         = _vp
+user32.GetDC.argtypes        = [_vp]
+user32.ReleaseDC.argtypes    = [_vp, _vp]
+
+gdi32.ChoosePixelFormat.restype  = ctypes.c_int
+gdi32.ChoosePixelFormat.argtypes = [_vp, ctypes.c_void_p]
+gdi32.SetPixelFormat.restype     = ctypes.c_bool
+gdi32.SetPixelFormat.argtypes    = [_vp, ctypes.c_int, ctypes.c_void_p]
+gdi32.SwapBuffers.restype        = ctypes.c_bool
+gdi32.SwapBuffers.argtypes       = [_vp]
+
+opengl32.wglCreateContext.restype  = _vp
+opengl32.wglCreateContext.argtypes = [_vp]
+opengl32.wglMakeCurrent.restype    = ctypes.c_bool
+opengl32.wglMakeCurrent.argtypes   = [_vp, _vp]
+opengl32.wglDeleteContext.restype  = ctypes.c_bool
+opengl32.wglDeleteContext.argtypes = [_vp]
+
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+PFD_DRAW_TO_WINDOW = 0x00000004
+PFD_SUPPORT_OPENGL = 0x00000020
+PFD_DOUBLEBUFFER   = 0x00000001
+PFD_TYPE_RGBA      = 0
+
+GL_BGRA_EXT = 0x80E1   # BGRA pixel format (matches mss output directly)
+
+CLASS_NAME = "FPSMagOverlayGL"
 _registered = False
 
 
+# ─── Structures ──────────────────────────────────────────────────────────────
+
+class PIXELFORMATDESCRIPTOR(ctypes.Structure):
+    _fields_ = [
+        ("nSize",           ctypes.c_ushort),
+        ("nVersion",        ctypes.c_ushort),
+        ("dwFlags",         ctypes.c_ulong),
+        ("iPixelType",      ctypes.c_ubyte),
+        ("cColorBits",      ctypes.c_ubyte),
+        ("cRedBits",        ctypes.c_ubyte),
+        ("cRedShift",       ctypes.c_ubyte),
+        ("cGreenBits",      ctypes.c_ubyte),
+        ("cGreenShift",     ctypes.c_ubyte),
+        ("cBlueBits",       ctypes.c_ubyte),
+        ("cBlueShift",      ctypes.c_ubyte),
+        ("cAlphaBits",      ctypes.c_ubyte),
+        ("cAlphaShift",     ctypes.c_ubyte),
+        ("cAccumBits",      ctypes.c_ubyte),
+        ("cAccumRedBits",   ctypes.c_ubyte),
+        ("cAccumGreenBits", ctypes.c_ubyte),
+        ("cAccumBlueBits",  ctypes.c_ubyte),
+        ("cAccumAlphaBits", ctypes.c_ubyte),
+        ("cDepthBits",      ctypes.c_ubyte),
+        ("cStencilBits",    ctypes.c_ubyte),
+        ("cAuxBuffers",     ctypes.c_ubyte),
+        ("iLayerType",      ctypes.c_ubyte),
+        ("bReserved",       ctypes.c_ubyte),
+        ("dwLayerMask",     ctypes.c_ulong),
+        ("dwVisibleMask",   ctypes.c_ulong),
+        ("dwDamageMask",    ctypes.c_ulong),
+    ]
+
+
+# ─── WndProc ────────────────────────────────────────────────────────────────
+
 def _wndproc(hwnd, msg, wp, lp):
     if msg == win32con.WM_NCHITTEST:
-        return -1                       # HTTRANSPARENT → clicks pass through
+        return -1                       # HTTRANSPARENT → clicks fall through
     if msg == win32con.WM_DESTROY:
         win32gui.PostQuitMessage(0)
         return 0
     return win32gui.DefWindowProc(hwnd, msg, wp, lp)
 
 
-class BITMAPINFOHEADER(ctypes.Structure):
-    _fields_ = [
-        ("biSize",          ctypes.c_uint32),
-        ("biWidth",         ctypes.c_int32),
-        ("biHeight",        ctypes.c_int32),
-        ("biPlanes",        ctypes.c_uint16),
-        ("biBitCount",      ctypes.c_uint16),
-        ("biCompression",   ctypes.c_uint32),
-        ("biSizeImage",     ctypes.c_uint32),
-        ("biXPelsPerMeter", ctypes.c_int32),
-        ("biYPelsPerMeter", ctypes.c_int32),
-        ("biClrUsed",       ctypes.c_uint32),
-        ("biClrImportant",  ctypes.c_uint32),
-    ]
-
+# ─── OpenGL Overlay Window ──────────────────────────────────────────────────
 
 class OverlayWindow:
+    """Win32 popup + OpenGL context. Always-on-top, click-through, excluded
+    from screen capture. Renders a textured quad with GPU filtering."""
+
     def __init__(self, x, y, w, h):
         global _registered
         hinst = win32api.GetModuleHandle(None)
 
         if not _registered:
             wc = win32gui.WNDCLASS()
-            wc.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW
+            wc.style = win32con.CS_OWNDC    # dedicated DC for OpenGL
             wc.lpfnWndProc = _wndproc
             wc.hInstance = hinst
             wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
@@ -85,9 +140,9 @@ class OverlayWindow:
             win32gui.RegisterClass(wc)
             _registered = True
 
-        ex = (0x00080000 |   # WS_EX_LAYERED
-              0x00000020 |   # WS_EX_TRANSPARENT
-              0x00000008 |   # WS_EX_TOPMOST
+        # No WS_EX_LAYERED — incompatible with OpenGL.
+        # Click-through via WM_NCHITTEST returning HTTRANSPARENT.
+        ex = (0x00000008 |   # WS_EX_TOPMOST
               0x00000080 |   # WS_EX_TOOLWINDOW
               0x08000000)    # WS_EX_NOACTIVATE
 
@@ -96,19 +151,56 @@ class OverlayWindow:
             x, y, w, h, 0, 0, hinst, None
         )
 
-        # Opaque layered window (needed for WS_EX_TRANSPARENT click-through)
-        user32.SetLayeredWindowAttributes(self.hwnd, 0, 255, 0x02)
-
-        # Tell Windows to exclude this window from all screen captures.
-        # mss / BitBlt / PrintWindow will never see it → no recursive capture.
+        # Exclude from screen capture (so mss never sees us)
         self.exclude_ok = bool(
             user32.SetWindowDisplayAffinity(self.hwnd, WDA_EXCLUDEFROMCAPTURE)
         )
         if not self.exclude_ok:
-            print("  ⚠  WDA_EXCLUDEFROMCAPTURE not supported (need Win10 2004+)")
-            print("     Using hide/show fallback — may flicker slightly.\n")
+            print("  ⚠  WDA_EXCLUDEFROMCAPTURE failed (need Win10 2004+)")
+            print("     Overlay may capture itself.\n")
 
-        self.hdc = win32gui.GetDC(self.hwnd)
+        # ── Set up OpenGL context ────────────────────────────────────────
+        # Use ctypes GetDC (not win32gui) so handle types stay consistent
+        self.hdc = user32.GetDC(self.hwnd)
+
+        pfd = PIXELFORMATDESCRIPTOR()
+        pfd.nSize = ctypes.sizeof(PIXELFORMATDESCRIPTOR)
+        pfd.nVersion = 1
+        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER
+        pfd.iPixelType = PFD_TYPE_RGBA
+        pfd.cColorBits = 32
+
+        fmt = gdi32.ChoosePixelFormat(self.hdc, ctypes.byref(pfd))
+        if fmt == 0:
+            raise RuntimeError("ChoosePixelFormat failed")
+        if not gdi32.SetPixelFormat(self.hdc, fmt, ctypes.byref(pfd)):
+            raise RuntimeError("SetPixelFormat failed")
+
+        self.hglrc = opengl32.wglCreateContext(self.hdc)
+        if not self.hglrc:
+            raise RuntimeError("wglCreateContext failed")
+        if not opengl32.wglMakeCurrent(self.hdc, self.hglrc):
+            raise RuntimeError("wglMakeCurrent failed")
+
+        # ── OpenGL state ─────────────────────────────────────────────────
+        glEnable(GL_TEXTURE_2D)
+        glClearColor(0, 0, 0, 1)
+
+        # Create texture
+        self.tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, self.tex)
+
+        gl_filter = GL_LINEAR if config.GPU_FILTER == "linear" else GL_NEAREST
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, gl_filter)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, gl_filter)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+
+        self._tex_w = 0
+        self._tex_h = 0
+        self.w = w
+        self.h = h
+
         self._topmost()
 
     # ── window management ────────────────────────────────────────────────
@@ -128,6 +220,7 @@ class OverlayWindow:
         win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
 
     def move(self, x, y, w, h):
+        self.w, self.h = w, h
         win32gui.SetWindowPos(
             self.hwnd, win32con.HWND_TOPMOST, x, y, w, h,
             win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW
@@ -136,24 +229,81 @@ class OverlayWindow:
     def topmost(self):
         self._topmost()
 
-    # ── drawing ──────────────────────────────────────────────────────────
+    # ── rendering ────────────────────────────────────────────────────────
 
-    def blit(self, pil_img):
-        w, h = pil_img.size
-        raw = pil_img.tobytes("raw", "BGRX")
-        bmi = BITMAPINFOHEADER()
-        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.biWidth = w
-        bmi.biHeight = -h          # negative = top-down
-        bmi.biPlanes = 1
-        bmi.biBitCount = 32
-        gdi32.SetDIBitsToDevice(
-            self.hdc, 0, 0, w, h, 0, 0, 0, h,
-            raw, ctypes.byref(bmi), 0
-        )
+    def render(self, raw_bgra, cap_w, cap_h):
+        """Upload raw BGRA pixels from mss and draw a fullscreen textured quad."""
+        opengl32.wglMakeCurrent(self.hdc, self.hglrc)
+        glViewport(0, 0, self.w, self.h)
+        glClear(GL_COLOR_BUFFER_BIT)
+
+        # Upload texture — use TexSubImage when dimensions match (faster)
+        glBindTexture(GL_TEXTURE_2D, self.tex)
+        if cap_w != self._tex_w or cap_h != self._tex_h:
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cap_w, cap_h, 0,
+                         GL_BGRA_EXT, GL_UNSIGNED_BYTE, raw_bgra)
+            self._tex_w = cap_w
+            self._tex_h = cap_h
+        else:
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cap_w, cap_h,
+                            GL_BGRA_EXT, GL_UNSIGNED_BYTE, raw_bgra)
+
+        # Draw textured quad (full viewport)
+        glEnable(GL_TEXTURE_2D)
+        glColor3f(1, 1, 1)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0, 1); glVertex2f(-1, -1)
+        glTexCoord2f(1, 1); glVertex2f( 1, -1)
+        glTexCoord2f(1, 0); glVertex2f( 1,  1)
+        glTexCoord2f(0, 0); glVertex2f(-1,  1)
+        glEnd()
+
+        # ── Decorations (drawn over the texture) ────────────────────────
+        glDisable(GL_TEXTURE_2D)
+
+        # One pixel in normalized device coords
+        px = 2.0 / self.w
+        py = 2.0 / self.h
+
+        # Border
+        if config.BORDER_PX > 0:
+            r, g, b = config.BORDER_COLOR
+            glColor3f(r, g, b)
+            glLineWidth(config.BORDER_PX)
+            # Inset by half a pixel so the line sits inside the window
+            inset_x = config.BORDER_PX * 0.5 * px
+            inset_y = config.BORDER_PX * 0.5 * py
+            glBegin(GL_LINE_LOOP)
+            glVertex2f(-1 + inset_x, -1 + inset_y)
+            glVertex2f( 1 - inset_x, -1 + inset_y)
+            glVertex2f( 1 - inset_x,  1 - inset_y)
+            glVertex2f(-1 + inset_x,  1 - inset_y)
+            glEnd()
+
+        # Crosshair with center gap
+        if config.CROSSHAIR:
+            r, g, b = config.CROSS_COLOR
+            glColor3f(r, g, b)
+            glLineWidth(config.CROSS_WIDTH)
+            gap_x = config.CROSS_GAP * px
+            gap_y = config.CROSS_GAP * py
+            len_x = config.CROSS_LEN * px
+            len_y = config.CROSS_LEN * py
+            glBegin(GL_LINES)
+            # Horizontal
+            glVertex2f(-len_x, 0); glVertex2f(-gap_x, 0)
+            glVertex2f( gap_x, 0); glVertex2f( len_x, 0)
+            # Vertical
+            glVertex2f(0, -len_y); glVertex2f(0, -gap_y)
+            glVertex2f(0,  gap_y); glVertex2f(0,  len_y)
+            glEnd()
+
+        gdi32.SwapBuffers(self.hdc)
 
     def destroy(self):
-        win32gui.ReleaseDC(self.hwnd, self.hdc)
+        opengl32.wglMakeCurrent(self.hdc, None)
+        opengl32.wglDeleteContext(self.hglrc)
+        user32.ReleaseDC(self.hwnd, self.hdc)
         win32gui.DestroyWindow(self.hwnd)
 
 
@@ -180,7 +330,7 @@ class Magnifier:
     def size(self):
         return int(self.radius * 2 * self.zoom)
 
-    # ── capture ──────────────────────────────────────────────────────────
+    # ── capture (returns raw BGRA bytes, no PIL) ─────────────────────────
 
     def grab(self):
         r = self.radius
@@ -188,24 +338,7 @@ class Magnifier:
             "left": max(0, self.cx - r), "top": max(0, self.cy - r),
             "width": r * 2, "height": r * 2,
         }
-        s = self.sct.grab(region)
-        return Image.frombytes("RGB", s.size, s.bgra, "raw", "BGRX")
-
-    def decorate(self, img):
-        draw = ImageDraw.Draw(img)
-        w, h = img.size
-
-        if config.BORDER_PX:
-            for i in range(config.BORDER_PX):
-                draw.rectangle([i, i, w-1-i, h-1-i], outline=config.BORDER_COLOR)
-
-        if config.CROSSHAIR:
-            cx, cy = w // 2, h // 2
-            g, s, lw, c = config.CROSS_GAP, config.CROSS_LEN, config.CROSS_WIDTH, config.CROSS_COLOR
-            draw.line([(cx-s, cy), (cx-g, cy)], fill=c, width=lw)
-            draw.line([(cx+g, cy), (cx+s, cy)], fill=c, width=lw)
-            draw.line([(cx, cy-s), (cx, cy-g)], fill=c, width=lw)
-            draw.line([(cx, cy+g), (cx, cy+s)], fill=c, width=lw)
+        return self.sct.grab(region)
 
     # ── window management ────────────────────────────────────────────────
 
@@ -222,21 +355,21 @@ class Magnifier:
     # ── main loop ────────────────────────────────────────────────────────
 
     def run(self):
-        self.zoomHook = keyboard.on_press_key(config.TOGGLE_KEY, lambda _: self.toggle(), suppress=False)
-        #keyboard.on_press_key("+", lambda _: self.adj_zoom(ZOOM_STEP))v
+        self.zoomHook = keyboard.on_press_key(
+            config.TOGGLE_KEY, lambda _: self.toggle(), suppress=False
+        )
         keyboard.on_press_key("=", lambda _: self.adj_zoom(config.ZOOM_STEP))
         keyboard.on_press_key("-", lambda _: self.adj_zoom(-config.ZOOM_STEP))
         keyboard.on_press_key("]", lambda _: self.adj_radius(config.CAPTURE_STEP))
         keyboard.on_press_key("[", lambda _: self.adj_radius(-config.CAPTURE_STEP))
-        #keyboard.on_press_key("esc", lambda _: self.quit())
 
         print("╔═══════════════════════════════════════════╗")
-        print("║        FPS Screen Magnifier               ║")
+        print("║     FPS Screen Magnifier  (GPU)           ║")
         print("╠═══════════════════════════════════════════╣")
         print(f"║  Toggle:   {config.TOGGLE_KEY:<30s} ║")
         print(f"║  Zoom:     +/-  ({self.zoom:.1f}x)                    ║")
         print(f"║  Region:   [/]  ({self.radius*2}px)                  ║")
-        print(f"║  Quit:     Esc                            ║")
+        print(f"║  Filter:   {config.GPU_FILTER:<30s} ║")
         print("╠═══════════════════════════════════════════╣")
         print("║  ⚠  Game must be Borderless Windowed      ║")
         print("╚═══════════════════════════════════════════╝")
@@ -250,24 +383,25 @@ class Magnifier:
             if self.on:
                 self.ensure_window()
 
-                # Re-assert topmost so the game can't bury us
                 now = time.perf_counter() * 1000
                 if now - self._last_topmost > config.TOPMOST_MS:
                     self.win.topmost()
                     self._last_topmost = now
 
-                # Fallback: hide overlay during capture if OS can't exclude it
-                fallback = not self.win.exclude_ok
+                # Fallback hide/show if WDA_EXCLUDEFROMCAPTURE isn't available
+                fallback = self.win and not self.win.exclude_ok
                 if fallback:
                     self.win.hide()
                     time.sleep(0.002)
 
-                img = self.grab()
-                sz = self.size
-                img = img.resize((sz, sz), config.SCALING)
-                self.decorate(img)
-                self.win.blit(img.convert("RGBX"))
-                self.win.show()
+                shot = self.grab()
+
+                # Ensure visible BEFORE render — SwapBuffers on a hidden
+                # window discards the frame (black screen on re-toggle).
+                # ShowWindow is a no-op when already visible, so this is cheap.
+                win32gui.ShowWindow(self.win.hwnd, win32con.SW_SHOWNOACTIVATE)
+
+                self.win.render(bytes(shot.raw), shot.width, shot.height)
             else:
                 if self.win:
                     self.win.hide()
@@ -304,19 +438,18 @@ class Magnifier:
         print("  Shutting down...")
         self.alive = False
 
-    # ── hotkey rebind ─────────────────────────────────────────────────────
+    # ── hotkey rebind ────────────────────────────────────────────────────
 
     def bind_hotkey(self):
-        # remove old binding
         if self.zoomHook is not None:
             keyboard.unhook(self.zoomHook)
-        # register new binding
-        self.zoomHook = keyboard.on_press_key(config.TOGGLE_KEY, lambda _: self.toggle(), suppress=False)
-        print(config.TOGGLE_KEY)
-        print("this was the new key change")
+        self.zoomHook = keyboard.on_press_key(
+            config.TOGGLE_KEY, lambda _: self.toggle(), suppress=False
+        )
 
     def update_hotkey(self):
         self.bind_hotkey()
+
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
