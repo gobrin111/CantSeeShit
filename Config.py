@@ -1,4 +1,4 @@
-from PIL import Image, ImageDraw
+from PIL import Image
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 class Config:
@@ -26,6 +26,6 @@ class Config:
         self.CROSS_GAP       = 4
         self.CROSS_WIDTH     = 1
 
-        self.SCALING         = Image.NEAREST   # NEAREST = crisp pixels, BILINEAR = smooth
-
+        # self.SCALING         = Image.NEAREST   # NEAREST = crisp pixels, BILINEAR = smooth
+        self.SCALING         = Image.LANCZOS
 config = Config()

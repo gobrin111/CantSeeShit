@@ -169,9 +169,7 @@ class Magnifier:
         self._last_topmost = 0
         self._last_size = 0
 
-        # self.hotkey_hook = None
         self.zoomHook = None
-        # self.bind_hotkey()
 
         self.sct = mss.mss()
         m = self.sct.monitors[1]
