@@ -113,6 +113,13 @@ class PIXELFORMATDESCRIPTOR(ctypes.Structure):
 def _wndproc(hwnd, msg, wp, lp):
     if msg == win32con.WM_NCHITTEST:
         return -1                       # HTTRANSPARENT → clicks fall through
+    if msg == win32con.WM_ERASEBKGND:
+        return 1                        # "We handled it" → prevents black fill
+    if msg == win32con.WM_PAINT:
+        # Validate the dirty region without actually painting —
+        # stops DefWindowProc from filling with BLACK_BRUSH over our GL content
+        win32gui.ValidateRect(hwnd, None)
+        return 0
     if msg == win32con.WM_DESTROY:
         win32gui.PostQuitMessage(0)
         return 0
@@ -217,7 +224,13 @@ class OverlayWindow:
         self._topmost()
 
     def hide(self):
-        win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
+        # Do NOT use SW_HIDE — it invalidates the GL surface and causes
+        # black frames on re-show. Move offscreen instead.
+        win32gui.SetWindowPos(
+            self.hwnd, win32con.HWND_TOPMOST,
+            -32000, -32000, 1, 1,
+            win32con.SWP_NOACTIVATE
+        )
 
     def move(self, x, y, w, h):
         self.w, self.h = w, h
@@ -318,6 +331,7 @@ class Magnifier:
         self.win = None
         self._last_topmost = 0
         self._last_size = 0
+        self._needs_reposition = False
 
         self.zoomHook = None
 
@@ -383,6 +397,14 @@ class Magnifier:
             if self.on:
                 self.ensure_window()
 
+                # First frame after toggle-on: move window back onscreen
+                if self._needs_reposition:
+                    sz = self.size
+                    ox, oy = self.cx - sz // 2, self.cy - sz // 2
+                    self.win.move(ox, oy, sz, sz)
+                    self._last_size = sz
+                    self._needs_reposition = False
+
                 now = time.perf_counter() * 1000
                 if now - self._last_topmost > config.TOPMOST_MS:
                     self.win.topmost()
@@ -396,10 +418,10 @@ class Magnifier:
 
                 shot = self.grab()
 
-                # Ensure visible BEFORE render — SwapBuffers on a hidden
-                # window discards the frame (black screen on re-toggle).
-                # ShowWindow is a no-op when already visible, so this is cheap.
-                win32gui.ShowWindow(self.win.hwnd, win32con.SW_SHOWNOACTIVATE)
+                if fallback:
+                    sz = self.size
+                    ox, oy = self.cx - sz // 2, self.cy - sz // 2
+                    self.win.move(ox, oy, sz, sz)
 
                 self.win.render(bytes(shot.raw), shot.width, shot.height)
             else:
@@ -421,6 +443,8 @@ class Magnifier:
 
     def toggle(self):
         self.on = not self.on
+        if self.on:
+            self._needs_reposition = True
         s = "ON " if self.on else "OFF"
         print(f"  ► Magnifier {s}  │  {self.zoom:.1f}x  │  {self.radius*2}px")
 
