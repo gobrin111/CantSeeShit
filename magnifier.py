@@ -47,6 +47,9 @@ _vp = ctypes.c_void_p   # shorthand for pointer-sized handles
 user32.GetDC.restype         = _vp
 user32.GetDC.argtypes        = [_vp]
 user32.ReleaseDC.argtypes    = [_vp, _vp]
+user32.GetWindowLongW.argtypes  = [_vp, ctypes.c_int]
+user32.SetWindowLongW.argtypes  = [_vp, ctypes.c_int, ctypes.c_long]
+user32.SetLayeredWindowAttributes.argtypes = [_vp, ctypes.c_uint, ctypes.c_ubyte, ctypes.c_uint]
 
 gdi32.ChoosePixelFormat.restype  = ctypes.c_int
 gdi32.ChoosePixelFormat.argtypes = [_vp, ctypes.c_void_p]
@@ -113,11 +116,11 @@ class PIXELFORMATDESCRIPTOR(ctypes.Structure):
 def _wndproc(hwnd, msg, wp, lp):
     if msg == win32con.WM_NCHITTEST:
         return -1                       # HTTRANSPARENT → clicks fall through
+    if msg == win32con.WM_SETCURSOR:
+        return 1                        # Prevent this window from changing cursor
     if msg == win32con.WM_ERASEBKGND:
-        return 1                        # "We handled it" → prevents black fill
+        return 1
     if msg == win32con.WM_PAINT:
-        # Validate the dirty region without actually painting —
-        # stops DefWindowProc from filling with BLACK_BRUSH over our GL content
         win32gui.ValidateRect(hwnd, None)
         return 0
     if msg == win32con.WM_DESTROY:
@@ -141,14 +144,13 @@ class OverlayWindow:
             wc.style = win32con.CS_OWNDC    # dedicated DC for OpenGL
             wc.lpfnWndProc = _wndproc
             wc.hInstance = hinst
-            wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
+            wc.hCursor = 0                  # No cursor — don't reveal arrow over overlay
             wc.hbrBackground = win32gui.GetStockObject(win32con.BLACK_BRUSH)
             wc.lpszClassName = CLASS_NAME
             win32gui.RegisterClass(wc)
             _registered = True
 
-        # No WS_EX_LAYERED — incompatible with OpenGL.
-        # Click-through via WM_NCHITTEST returning HTTRANSPARENT.
+        # Create WITHOUT WS_EX_LAYERED — added after GL context init.
         ex = (0x00000008 |   # WS_EX_TOPMOST
               0x00000080 |   # WS_EX_TOOLWINDOW
               0x08000000)    # WS_EX_NOACTIVATE
@@ -188,6 +190,23 @@ class OverlayWindow:
             raise RuntimeError("wglCreateContext failed")
         if not opengl32.wglMakeCurrent(self.hdc, self.hglrc):
             raise RuntimeError("wglMakeCurrent failed")
+
+        # ── Retrofit layered + transparent AFTER GL context is created ────
+        # WS_EX_LAYERED can't be set before wglCreateContext (breaks GL),
+        # but adding it after works on Windows 8+ with DWM compositing.
+        # This gives us proper input transparency (WS_EX_TRANSPARENT).
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED     = 0x00080000
+        WS_EX_TRANSPARENT  = 0x00000020
+        LWA_ALPHA = 0x02
+
+        old_ex = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
+        user32.SetWindowLongW(
+            self.hwnd, GWL_EXSTYLE,
+            old_ex | WS_EX_LAYERED | WS_EX_TRANSPARENT
+        )
+        # Full opacity — we just need the layered flag for click-through
+        user32.SetLayeredWindowAttributes(self.hwnd, 0, 255, LWA_ALPHA)
 
         # ── OpenGL state ─────────────────────────────────────────────────
         glEnable(GL_TEXTURE_2D)
@@ -473,7 +492,6 @@ class Magnifier:
 
     def update_hotkey(self):
         self.bind_hotkey()
-
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
