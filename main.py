@@ -8,9 +8,6 @@ from Config import config
 
 mag = Magnifier()
 
-# def start_mag():
-#     threading.Thread(target=mag.run, daemon=True).start()
-
 threading.Thread(target=mag.run, daemon=True).start()
 
 def toggle():
@@ -47,7 +44,6 @@ waiting_for_key = False
 
 
 def set_new_key(event):
-    # global config.TOGGLE_KEY
     global waiting_for_key
 
     if not waiting_for_key:
@@ -82,6 +78,5 @@ keybind_button = tk.Button(
 )
 
 keybind_button.pack(pady=40)
-# print("raradadadawdaed")
 
 root.mainloop()
